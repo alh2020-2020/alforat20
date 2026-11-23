@@ -23,13 +23,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from PIL import Image, UnidentifiedImageError
-from pathlib import Path
+
+from PIL import Image, UnidentifiedImageError
+
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / 'static' if (ROOT / 'static').is_dir() else ROOT
-  
-ROOT = Path(__file__).resolve().parent
 
-STATIC = ROOT / 'static' if (ROOT / 'static').is_dir() else ROOT '
 # When deployed with a Railway Volume, store mutable files on persistent storage.
 # The bundled catalog/social seed JSON files remain in ROOT/data.
 VOLUME = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '').strip()
