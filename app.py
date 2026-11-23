@@ -27,7 +27,9 @@ from PIL import Image, UnidentifiedImageError
 STATIC = ROOT / 'static' if (ROOT / 'static').is_dir() else ROOT
   
 ROOT = Path(__file__).resolve().parent
-STATIC = ROOT / 'static'
+
+STATIC = ROOT / 'static' if (ROOT / 'static').is_dir() else ROOT
+  '
 # When deployed with a Railway Volume, store mutable files on persistent storage.
 # The bundled catalog/social seed JSON files remain in ROOT/data.
 VOLUME = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '').strip()
