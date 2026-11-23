@@ -23,7 +23,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from PIL import Image, UnidentifiedImageError
-
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / 'static' if (ROOT / 'static').is_dir() else ROOT
   
 ROOT = Path(__file__).resolve().parent
