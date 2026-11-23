@@ -1,0 +1,805 @@
+--- a/app.py
++++ b/app.py
+@@ -13,13 +13,16 @@
+ import sqlite3
+ import time
+ import uuid
++from contextlib import closing
+ from datetime import datetime, timezone
+ from pathlib import Path
+ from typing import Any
+ from urllib.parse import urlparse
+ 
+ from fastapi import Depends, FastAPI, HTTPException, Request, Response
+-from fastapi.responses import FileResponse
++from fastapi.exception_handlers import request_validation_exception_handler
++from fastapi.exceptions import RequestValidationError
++from fastapi.responses import FileResponse, JSONResponse
+ from fastapi.staticfiles import StaticFiles
+ from pydantic import BaseModel, Field, field_validator
+ from PIL import Image, UnidentifiedImageError
+@@ -38,11 +41,28 @@
+ UPLOADS.mkdir(parents=True, exist_ok=True)
+ DB.parent.mkdir(parents=True, exist_ok=True)
+ COOKIE = 'alfurat_admin_session'
++CUSTOMER_COOKIE = 'alfurat_customer_session'
+ SESSION_AGE = 7 * 24 * 3600
+ MAX_UPLOAD_BYTES = 4 * 1024 * 1024
+ 
+ app = FastAPI(title='الفرات موبايل', docs_url=None, redoc_url=None)
+-app.mount('/static', StaticFiles(directory=STATIC), name='static')
++
++
++class StoreStaticFiles(StaticFiles):
++    public_files = {
++        'styles.css', 'app.js', 'catalog.css', 'catalog.js', 'admin.css', 'admin.js',
++        'account.css', 'account.js',
++    }
++
++    async def get_response(self, path, scope):
++        if path not in self.public_files and not (
++            path.startswith('assets/') and all(not part.startswith('.') for part in path.split('/'))
++        ):
++            raise HTTPException(404)
++        return await super().get_response(path, scope)
++
++
++app.mount('/static', StoreStaticFiles(directory=STATIC), name='static')
+ app.mount('/uploads', StaticFiles(directory=UPLOADS), name='uploads')
+ 
+ 
+@@ -104,6 +124,24 @@
+         payment_method TEXT NOT NULL, items_json TEXT NOT NULL, total REAL NOT NULL,
+         status TEXT NOT NULL, created_at TEXT NOT NULL);
+     ''')
++    db.execute('BEGIN IMMEDIATE')
++    try:
++        db.execute('''CREATE TABLE IF NOT EXISTS customers (
++            id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
++            password_hash TEXT NOT NULL, created_at TEXT NOT NULL)''')
++        db.execute('''CREATE TABLE IF NOT EXISTS customer_sessions (
++            token_hash TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customers(id),
++            expires INTEGER NOT NULL)''')
++        db.execute('''CREATE TABLE IF NOT EXISTS customer_auth_limits (
++            ip TEXT NOT NULL, action TEXT NOT NULL, started INTEGER NOT NULL,
++            attempts INTEGER NOT NULL, PRIMARY KEY (ip, action))''')
++        if 'customer_id' not in {row['name'] for row in db.execute('PRAGMA table_info(orders)')}:
++            db.execute('ALTER TABLE orders ADD COLUMN customer_id TEXT REFERENCES customers(id)')
++        db.execute('CREATE INDEX IF NOT EXISTS orders_customer_date ON orders(customer_id, created_at DESC)')
++        db.commit()
++    except Exception:
++        db.rollback()
++        raise
+     defaults = {
+         'store_name': 'الفرات موبايل',
+         'store_subtitle': 'عالم التقنية بين يديك',
+@@ -316,6 +354,32 @@
+ URL_SETTINGS = {'logo_url','instagram','facebook','facebook_page_url','tiktok','youtube','telegram','snapchat','x','app_url'}
+ 
+ 
++class CustomerLogin(BaseModel):
++    email: str = Field(min_length=3, max_length=254)
++    password: str = Field(min_length=1, max_length=128)
++
++    @field_validator('email')
++    @classmethod
++    def normalize_email(cls, value):
++        value = value.strip().lower()
++        if not re.fullmatch(r'[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+', value):
++            raise ValueError('البريد الإلكتروني غير صالح')
++        return value
++
++
++class CustomerRegistration(CustomerLogin):
++    name: str = Field(min_length=2, max_length=100)
++    password: str = Field(min_length=12, max_length=128)
++
++    @field_validator('name')
++    @classmethod
++    def normalize_name(cls, value):
++        value = value.strip()
++        if len(value) < 2:
++            raise ValueError('أدخل اسماً من حرفين على الأقل')
++        return value
++
++
+ class OrderItem(BaseModel):
+     id: str = Field(min_length=1, max_length=70)
+     quantity: int = Field(ge=1, le=99)
+@@ -338,6 +402,11 @@
+ @app.get('/')
+ def home():
+     return FileResponse(STATIC/'index.html')
++
++
++@app.get('/account')
++def account():
++    return FileResponse(STATIC/'account.html')
+ 
+ 
+ @app.get('/health')
+@@ -435,13 +504,155 @@
+     return {'ok':True}
+ 
+ 
++def customer_action(request: Request):
++    if request.headers.get('x-store-action') != 'customer':
++        raise HTTPException(403, 'أعد تحميل الصفحة وحاول مجدداً')
++
++
++def limit_customer_auth(request: Request, action: str, limit: int):
++    ip = request.client.host if request.client else 'unknown'
++    now = int(time.time())
++    with closing(conn()) as db:
++        db.execute('BEGIN IMMEDIATE')
++        db.execute('DELETE FROM customer_auth_limits WHERE started <= ?', (now - 600,))
++        row = db.execute(
++            'SELECT attempts FROM customer_auth_limits WHERE ip=? AND action=?', (ip, action)
++        ).fetchone()
++        if row and row['attempts'] >= limit:
++            raise HTTPException(429, 'محاولات كثيرة. حاول مرة أخرى لاحقاً.')
++        db.execute('''INSERT INTO customer_auth_limits VALUES (?,?,?,1)
++            ON CONFLICT(ip, action) DO UPDATE SET attempts=attempts+1''', (ip, action, now))
++        db.commit()
++
++
++def customer_token_hash(request: Request):
++    return hashlib.sha256(request.cookies.get(CUSTOMER_COOKIE, '').encode()).hexdigest()
++
++
++def current_customer(request: Request):
++    if not request.cookies.get(CUSTOMER_COOKIE):
++        return None
++    with closing(conn()) as db:
++        return db.execute('''SELECT c.id, c.name, c.email FROM customers c
++            JOIN customer_sessions s ON s.customer_id=c.id
++            WHERE s.token_hash=? AND s.expires>?''',
++            (customer_token_hash(request), int(time.time()))).fetchone()
++
++
++def start_customer_session(db, customer_id, request, response):
++    token = secrets.token_urlsafe(36)
++    now = int(time.time())
++    db.execute('DELETE FROM customer_sessions WHERE expires<=? OR token_hash=?',
++               (now, customer_token_hash(request)))
++    db.execute('INSERT INTO customer_sessions VALUES (?,?,?)',
++               (hashlib.sha256(token.encode()).hexdigest(), customer_id, now + SESSION_AGE))
++    response.set_cookie(CUSTOMER_COOKIE, token, max_age=SESSION_AGE, httponly=True,
++                        samesite='strict', secure=(request.url.scheme == 'https'
++                            or bool(os.environ.get('RAILWAY_ENVIRONMENT'))
++                            or os.environ.get('FORCE_SECURE_COOKIE') == '1'), path='/')
++    response.headers['Cache-Control'] = 'no-store'
++
++
++DUMMY_CUSTOMER_HASH = hash_password(secrets.token_urlsafe(24))
++
++
++@app.post('/api/account/register', status_code=201, dependencies=[Depends(customer_action)])
++def customer_register(data: CustomerRegistration, request: Request, response: Response):
++    limit_customer_auth(request, 'register', 10)
++    customer_id = uuid.uuid4().hex
++    password_hash = hash_password(data.password)
++    with closing(conn()) as db:
++        db.execute('BEGIN IMMEDIATE')
++        inserted = db.execute('''INSERT INTO customers VALUES (?,?,?,?,?)
++            ON CONFLICT(email) DO NOTHING''',
++            (customer_id, data.email, data.name, password_hash, utc_now()))
++        if not inserted.rowcount:
++            raise HTTPException(409, 'تعذر إنشاء الحساب بهذا البريد. جرّب تسجيل الدخول.')
++        start_customer_session(db, customer_id, request, response)
++        db.commit()
++    return {'ok': True}
++
++
++@app.post('/api/account/login', dependencies=[Depends(customer_action)])
++def customer_login(data: CustomerLogin, request: Request, response: Response):
++    limit_customer_auth(request, 'login', 20)
++    with closing(conn()) as db:
++        row = db.execute('SELECT id, password_hash FROM customers WHERE email=?', (data.email,)).fetchone()
++        valid = check_password(data.password, row['password_hash'] if row else DUMMY_CUSTOMER_HASH)
++        if not valid or not row:
++            raise HTTPException(401, 'البريد الإلكتروني أو كلمة المرور غير صحيحة')
++        db.execute('BEGIN IMMEDIATE')
++        start_customer_session(db, row['id'], request, response)
++        db.commit()
++    return {'ok': True}
++
++
++@app.post('/api/account/logout', dependencies=[Depends(customer_action)])
++def customer_logout(request: Request, response: Response):
++    with closing(conn()) as db:
++        db.execute('DELETE FROM customer_sessions WHERE token_hash=?', (customer_token_hash(request),))
++    response.delete_cookie(CUSTOMER_COOKIE, path='/')
++    response.headers['Cache-Control'] = 'no-store'
++    return {'ok': True}
++
++
++@app.exception_handler(RequestValidationError)
++async def validation_error(request: Request, exc: RequestValidationError):
++    if request.url.path in ('/api/account/register', '/api/account/login'):
++        return JSONResponse(
++            {'detail': 'تحقق من الاسم والبريد الإلكتروني وكلمة المرور وحاول مجددًا.'},
++            status_code=422, headers={'Cache-Control': 'no-store'},
++        )
++    return await request_validation_exception_handler(request, exc)
++
++
++def public_customer(customer):
++    return {'name': customer['name'], 'email': customer['email']} if customer is not None else None
++
++
++@app.get('/api/account/profile')
++def customer_profile(response: Response, customer=Depends(current_customer)):
++    response.headers['Cache-Control'] = 'no-store'
++    return {'customer': public_customer(customer)}
++
++
++@app.get('/api/account')
++def customer_account(response: Response, customer=Depends(current_customer)):
++    response.headers['Cache-Control'] = 'no-store'
++    if customer is None:
++        return {'customer': None}
++    with closing(conn()) as db:
++        orders = [dict(row) for row in db.execute('''SELECT id, created_at, status, total, items_json
++            FROM orders WHERE customer_id=? ORDER BY created_at DESC, id DESC LIMIT 100''', (customer['id'],))]
++        currency = settings(db).get('currency', 'ر.ي')
++    for order in orders:
++        order['items'] = json.loads(order.pop('items_json'))
++    return {'customer': public_customer(customer), 'orders': orders, 'currency': currency}
++
++
++@app.get('/api/admin/customers')
++def admin_customers(response: Response, q: str = '', page: int = 1, admin=Depends(require_admin)):
++    if not 1 <= page <= 100000 or len(q) > 254:
++        raise HTTPException(422, 'بحث غير صالح')
++    response.headers['Cache-Control'] = 'no-store'
++    with closing(conn()) as db:
++        rows = db.execute('''SELECT c.name, c.email, c.created_at,
++            (SELECT COUNT(*) FROM orders WHERE customer_id=c.id) AS order_count
++            FROM customers c WHERE instr(lower(c.email), lower(?)) OR instr(lower(c.name), lower(?))
++            ORDER BY c.created_at DESC, c.id DESC LIMIT 51 OFFSET ?''',
++            (q.strip(), q.strip(), (page - 1) * 50)).fetchall()
++    return {'customers': [dict(row) for row in rows[:50]], 'has_more': len(rows) > 50}
++
++
+ @app.get('/api/admin/data')
+-def admin_data(admin=Depends(require_admin)):
++def admin_data(response: Response, admin=Depends(require_admin)):
++    response.headers['Cache-Control'] = 'no-store'
+     with conn() as db:
+         orders = [dict(x) for x in db.execute('SELECT * FROM orders ORDER BY created_at DESC LIMIT 500')]
+         for x in orders:
+             x['items'] = json.loads(x.pop('items_json'))
+-        return {'settings':settings(db),'products':product_rows(db),'videos':video_rows(db),'social_posts':social_rows(db),'orders':orders}
++        customer_count = db.execute('SELECT COUNT(*) FROM customers').fetchone()[0]
++        return {'customer_count':customer_count,'settings':settings(db),'products':product_rows(db),'videos':video_rows(db),'social_posts':social_rows(db),'orders':orders}
+ 
+ 
+ @app.put('/api/admin/settings')
+@@ -634,7 +845,9 @@
+ 
+ 
+ @app.post('/api/orders')
+-def place_order(data: OrderIn):
++def place_order(data: OrderIn, request: Request, customer=Depends(current_customer)):
++    if customer is not None:
++        customer_action(request)
+     ids=[x.id for x in data.items]
+     if len(set(ids)) != len(ids):
+         raise HTTPException(422,'منتجات مكررة في الطلب')
+@@ -657,11 +870,11 @@
+                 items.append({'id':p['id'],'name':p['name'],'quantity':requested.quantity,'price':p['price'],'subtotal':subtotal})
+             order_id='FUR-'+datetime.now().strftime('%y%m%d')+'-'+secrets.token_hex(3).upper()
+             db.execute('''INSERT INTO orders
+-                (id,customer_name,phone,city,address,note,payment_method,items_json,total,status,created_at)
+-                VALUES (?,?,?,?,?,?,?,?,?,?,?)''',(
++                (id,customer_name,phone,city,address,note,payment_method,items_json,total,status,created_at,customer_id)
++                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',(
+                 order_id,data.customer_name.strip(),data.phone.strip(),data.city.strip(),
+                 data.address.strip(),data.note.strip(),data.payment_method,
+-                json.dumps(items,ensure_ascii=False),total,'جديد',utc_now()
++                json.dumps(items,ensure_ascii=False),total,'جديد',utc_now(),customer['id'] if customer is not None else None
+             ))
+             db.commit()
+             return {'ok':True,'order_id':order_id,'total':total,'items':items}
+--- a/app.js
++++ b/app.js
+@@ -37,13 +37,35 @@
+ function allStoreVideos(){const fbFromPosts=state.social_posts.filter(p=>p.post_type==='video'&&isFacebookLink(p.url)).map(p=>({id:'post:'+p.id,title:p.title,description:p.description,url:p.url,thumbnail_url:p.image_url,origin:'facebook'}));return [...fbFromPosts,...state.videos,...houseClips];}
+ const money=(p)=>Number(p)>0?new Intl.NumberFormat('ar-YE',{maximumFractionDigits:2}).format(Number(p))+' '+esc(state.settings.currency||'ر.ي'):'السعر عند الطلب';
+ function toast(message){const el=$('#toast');el.textContent=message;el.classList.add('show');clearTimeout(toast._id);toast._id=setTimeout(()=>el.classList.remove('show'),3000);}
+-function safePhone(v){return String(v||'').replace(/[^0-9]/g,'');}
++function whatsappNumber(value) {
++  const digits = String(value ?? '').replace(/[٠-٩۰-۹]/g, digit => String(digit.charCodeAt(0) & 15)).replace(/\D/g, '');
++  const number = digits.replace(/^00/, '');
++  const local = number.replace(/^0/, '');
++  if (/^7\d{8}$/.test(local)) return '967' + local;
++  return /^[1-9]\d{7,14}$/.test(number) ? number : '';
++}
++
++function inquireAboutCart() {
++  const number = whatsappNumber(state.settings.whatsapp);
++  if (!number || !state.cart.length) return;
++
++  const items = state.cart.map(({id, quantity}) => {
++    const product = state.products.find(product => product.id === id);
++    return `• ${product.name} × ${quantity}`;
++  });
++  const url = new URL('https://wa.me/' + number);
++  url.searchParams.set('text', [
++    'مرحباً الفرات موبايل، أود الاستفسار عن السعر والتوفر للمنتجات التالية:',
++    ...items
++  ].join('\n'));
++  window.open(url.href, '_blank', 'noopener,noreferrer');
++}
+ function externalUrl(value){try{const u=new URL(value);return /^https?:$/.test(u.protocol)?u.href:'';}catch{return '';}}
+ function videoId(raw){try{const u=new URL(raw);const host=u.hostname.toLowerCase();if(['youtu.be','www.youtu.be'].includes(host))return u.pathname.split('/')[1]?.match(/^[\w-]{11}$/)?.[0]||'';if(['youtube.com','www.youtube.com','m.youtube.com','youtube-nocookie.com','www.youtube-nocookie.com'].includes(host)){const id=u.searchParams.get('v')||(u.pathname.match(/\/(?:shorts|embed|live)\/([\w-]{11})/)||[])[1];return /^[\w-]{11}$/.test(id||'')?id:'';}}catch{}return '';}
+ function applySettings(){const s=state.settings;$('#brand-name').innerHTML=esc(s.store_name||'الفرات موبايل').replace('موبايل','<em>موبايل</em>');$('#brand-subtitle').textContent=s.store_subtitle||'';$('#announcement').textContent=s.announcement||'';$('#hero-title').innerHTML=esc(s.hero_title||'تقنيتك تبدأ من هنا').replace(/(تبدأ من هنا|من هنا|التقنية)/,'<span class="gradient-text">$1</span>');$('#hero-description').textContent=s.hero_description||'';$('#store-address').textContent=s.address||'العنوان يضاف من لوحة التحكم';$('#delivery-note').textContent=s.delivery_text||'اسأل عن التوصيل';$('#footer-payment').textContent=s.payment_text||'';$('#current-year').textContent=new Date().getFullYear();document.title=(s.store_name||'الفرات موبايل')+' | '+(s.store_subtitle||'متجر التقنية');
+  const brand=$('#header-logo-image');if(s.logo_url){brand.src=s.logo_url;brand.classList.remove('hidden');$('.default-brand').classList.add('hidden');brand.onerror=()=>{brand.classList.add('hidden');$('.default-brand').classList.remove('hidden');};}
+  if(s.phone){$('#store-phone-wrap').hidden=false;$('#store-phone').textContent=s.phone;}
+- const wa=safePhone(s.whatsapp);if(wa){$('#whatsapp-cta').href='https://wa.me/'+wa;$('#whatsapp-cta').target='_blank';$('#whatsapp-cta').rel='noopener noreferrer';}else{$('#whatsapp-cta').addEventListener('click',ev=>{ev.preventDefault();toast('لم يتم إضافة رقم واتساب بعد. يمكنك إرسال طلب عبر السلة.');});}
++ const wa=whatsappNumber(s.whatsapp);if(wa){$('#whatsapp-cta').href='https://wa.me/'+wa;$('#whatsapp-cta').target='_blank';$('#whatsapp-cta').rel='noopener noreferrer';}else{$('#whatsapp-cta').addEventListener('click',ev=>{ev.preventDefault();toast('لم يتم إضافة رقم واتساب بعد. يمكنك إرسال طلب عبر السلة.');});}
+  const socials=['whatsapp','instagram','facebook','tiktok','youtube','telegram','snapchat','x'];const icons={x:'external',snapchat:'external'};$('#social-links').innerHTML=socials.map(platform=>{const u=platform==='whatsapp'?(wa?'https://wa.me/'+wa:''):externalUrl(s[platform]);return u?`<a target="_blank" rel="noopener noreferrer" href="${esc(u)}" aria-label="${platform}" title="${platform}">${svgIcon(icons[platform]||platform)}</a>`:'';}).join('');
+  const fb=externalUrl(s.facebook);for(const id of ['facebook-section-link','facebook-follow-btn']){const el=$('#'+id);if(el&&fb)el.href=fb;}
+  const page=externalUrl(s.facebook_page_url);if(page){try{const u=new URL(page);const host=u.hostname.replace(/^www\./,'').toLowerCase();const valid=host==='facebook.com'&&!u.pathname.startsWith('/share/')&&u.pathname.length>2;if(valid){$('#facebook-embed-wrapper').hidden=false;$('#facebook-embed').src='https://www.facebook.com/plugins/page.php?href='+encodeURIComponent(page)+'&tabs=timeline&width=500&height=520&small_header=false&adapt_container_width=true&hide_cover=false&show_facepile=false';}}catch{}}
+@@ -82,7 +104,7 @@
+ function adjustCart(id,delta){const item=state.cart.find(x=>x.id===id);const p=state.products.find(x=>x.id===id);if(!item||!p)return;item.quantity=Math.max(0,Math.min(99,p.stock===-1?99:p.stock,item.quantity+delta));state.cart=state.cart.filter(x=>x.quantity>0);persistCart();}
+ function removeCart(id){state.cart=state.cart.filter(x=>x.id!==id);persistCart();}
+ function cartTotal(){const products=state.cart.map(item=>({item,product:state.products.find(p=>p.id===item.id)})).filter(x=>x.product);return {total:products.reduce((sum,{item,product})=>sum+Number(product.price)*item.quantity,0),uncertain:products.some(({product})=>!Number(product.price))};}
+-function renderCart(){state.cart=state.cart.filter(x=>state.products.some(p=>p.id===x.id));const count=state.cart.reduce((sum,x)=>sum+x.quantity,0);$('#cart-count').textContent=count;$('#cart-heading-count').textContent=`(${count})`;const {total,uncertain}=cartTotal();$('#cart-total').textContent=uncertain?'يحدد بعد التأكيد':money(total);$('#checkout-total').textContent=uncertain?'يحدد بعد التأكيد':money(total);$('#cart-items').innerHTML=state.cart.length?state.cart.map(item=>{const p=state.products.find(p=>p.id===item.id);return `<div class="cart-item"><div class="cart-mini-art">${imageFor(p)}</div><div class="cart-item-text"><strong>${esc(p.name)}</strong><small>${money(p.price)}</small><div class="quantity-controls"><button aria-label="زيادة" data-qty="${esc(p.id)}" data-delta="1">${svgIcon('plus')}</button><b>${item.quantity}</b><button aria-label="تقليل" data-qty="${esc(p.id)}" data-delta="-1">${svgIcon('minus')}</button></div></div><button class="cart-remove" data-remove="${esc(p.id)}" aria-label="حذف">${svgIcon('trash')}</button></div>`;}).join(''):`<div class="cart-empty">${svgIcon('bag')}<strong>سلتك فارغة حالياً</strong><p>ابدأ باكتشاف منتجاتنا وأضف ما يعجبك.</p></div>`;$$('[data-qty]').forEach(b=>b.onclick=()=>adjustCart(b.dataset.qty,+b.dataset.delta));$$('[data-remove]').forEach(b=>b.onclick=()=>removeCart(b.dataset.remove));$('#checkout-btn').disabled=!state.cart.length;}
++function renderCart(){state.cart=state.cart.filter(x=>state.products.some(p=>p.id===x.id));const count=state.cart.reduce((sum,x)=>sum+x.quantity,0);$('#cart-count').textContent=count;$('#cart-heading-count').textContent=`(${count})`;const {total,uncertain}=cartTotal();$('#cart-total').textContent=uncertain?'يحدد بعد التأكيد':money(total);$('#checkout-total').textContent=uncertain?'يحدد بعد التأكيد':money(total);$('#cart-items').innerHTML=state.cart.length?state.cart.map(item=>{const p=state.products.find(p=>p.id===item.id);return `<div class="cart-item"><div class="cart-mini-art">${imageFor(p)}</div><div class="cart-item-text"><strong>${esc(p.name)}</strong><small>${money(p.price)}</small><div class="quantity-controls"><button aria-label="زيادة" data-qty="${esc(p.id)}" data-delta="1">${svgIcon('plus')}</button><b>${item.quantity}</b><button aria-label="تقليل" data-qty="${esc(p.id)}" data-delta="-1">${svgIcon('minus')}</button></div></div><button class="cart-remove" data-remove="${esc(p.id)}" aria-label="حذف">${svgIcon('trash')}</button></div>`;}).join(''):`<div class="cart-empty">${svgIcon('bag')}<strong>سلتك فارغة حالياً</strong><p>ابدأ باكتشاف منتجاتنا وأضف ما يعجبك.</p></div>`;$$('[data-qty]').forEach(b=>b.onclick=()=>adjustCart(b.dataset.qty,+b.dataset.delta));$$('[data-remove]').forEach(b=>b.onclick=()=>removeCart(b.dataset.remove));$('#checkout-btn').disabled=!state.cart.length;$('#cart-inquiry').hidden=!state.cart.length||!whatsappNumber(state.settings.whatsapp);}
+ function lockPage(isLocked){document.body.classList.toggle('no-scroll',isLocked);$('#overlay').hidden=!isLocked;}
+ function openDrawer(){$('#cart-drawer').classList.add('open');$('#cart-drawer').setAttribute('aria-hidden','false');lockPage(true);}
+ function closeDrawer(){$('#cart-drawer').classList.remove('open');$('#cart-drawer').setAttribute('aria-hidden','true');lockPage(false);}
+@@ -105,8 +127,24 @@
+  window.open(u,'_blank','noopener,noreferrer');
+ }
+ 
+-async function submitOrder(e){e.preventDefault();const btn=$('#submit-order');btn.disabled=true;btn.textContent='جارٍ إرسال الطلب...';const form=new FormData(e.currentTarget);const payload=Object.fromEntries(form.entries());payload.items=state.cart.map(x=>({id:x.id,quantity:x.quantity}));try{const res=await fetch('/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok)throw new Error(typeof data.detail==='string'?data.detail:'تعذر إرسال الطلب؛ تأكد من البيانات');state.cart=[];persistCart();$('#checkout-form').hidden=true;const wa=safePhone(state.settings.whatsapp);const lines=data.items.map(i=>`• ${i.name} × ${i.quantity}`).join('\n');const msg=`طلب جديد من متجر الفرات موبايل\nرقم الطلب: ${data.order_id}\nالاسم: ${payload.customer_name}\nالجوال: ${payload.phone}\nالمدينة: ${payload.city}\nالعنوان: ${payload.address}\nالمنتجات:\n${lines}`;$('#order-success').hidden=false;$('#order-success').innerHTML=`<div class="success-mark">${svgIcon('check')}</div><h3>وصل طلبك بنجاح!</h3><p>تم تسجيل طلبك في لوحة إدارة المتجر. احتفظ برقم الطلب للمتابعة. سيتم تأكيد التوفر والسعر النهائي وطريقة الدفع معك.</p><span class="order-id">${esc(data.order_id)}</span>${wa?`<a class="btn btn-primary btn-wide" target="_blank" rel="noopener noreferrer" href="https://wa.me/${wa}?text=${encodeURIComponent(msg)}">${svgIcon('whatsapp')} أرسل تفاصيل الطلب على واتساب</a>`:''}<button type="button" class="btn btn-soft btn-wide" style="margin-top:10px" id="close-success">العودة إلى المتجر</button>`;$('#close-success').onclick=closeModals;}catch(err){toast(err.message||'حدث خطأ أثناء الطلب');}finally{btn.disabled=false;btn.innerHTML='إرسال الطلب '+svgIcon('check');}}
++async function loadCheckoutAccount() {
++  const form = $('#checkout-form');
++  const note = $('#checkout-account-note');
++  note.hidden = false;
++  try {
++    const response = await fetch('/api/account/profile', {cache:'no-store'});
++    if (!response.ok) return;
++    const {customer} = await response.json();
++    if (!customer || $('#checkout-modal').hidden) return;
++    note.hidden = true;
++    if (!form.elements.customer_name.value) form.elements.customer_name.value = customer.name;
++  } catch {
++    // Checkout remains available while the account endpoint is unreachable.
++  }
++}
++
++async function submitOrder(e){e.preventDefault();const btn=$('#submit-order');btn.disabled=true;btn.textContent='جارٍ إرسال الطلب...';const form=new FormData(e.currentTarget);const payload=Object.fromEntries(form.entries());payload.items=state.cart.map(x=>({id:x.id,quantity:x.quantity}));try{const res=await fetch('/api/orders',{method:'POST',headers:{'Content-Type':'application/json','X-Store-Action':'customer'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok)throw new Error(typeof data.detail==='string'?data.detail:'تعذر إرسال الطلب؛ تأكد من البيانات');state.cart=[];persistCart();$('#checkout-form').hidden=true;const wa=whatsappNumber(state.settings.whatsapp);const lines=data.items.map(i=>`• ${i.name} × ${i.quantity}`).join('\n');const msg=`طلب جديد من متجر الفرات موبايل\nرقم الطلب: ${data.order_id}\nالاسم: ${payload.customer_name}\nالجوال: ${payload.phone}\nالمدينة: ${payload.city}\nالعنوان: ${payload.address}\nالمنتجات:\n${lines}`;$('#order-success').hidden=false;$('#order-success').innerHTML=`<div class="success-mark">${svgIcon('check')}</div><h3>وصل طلبك بنجاح!</h3><p>تم تسجيل طلبك في لوحة إدارة المتجر. احتفظ برقم الطلب للمتابعة. سيتم تأكيد التوفر والسعر النهائي وطريقة الدفع معك.</p><span class="order-id">${esc(data.order_id)}</span>${wa?`<a class="btn btn-primary btn-wide" target="_blank" rel="noopener noreferrer" href="https://wa.me/${wa}?text=${encodeURIComponent(msg)}">${svgIcon('whatsapp')} أرسل تفاصيل الطلب على واتساب</a>`:''}<button type="button" class="btn btn-soft btn-wide" style="margin-top:10px" id="close-success">العودة إلى المتجر</button>`;$('#close-success').onclick=closeModals;}catch(err){toast(err.message||'حدث خطأ أثناء الطلب');}finally{btn.disabled=false;btn.innerHTML='إرسال الطلب '+svgIcon('check');}}
+ async function loadCatalog(){try{const r=await fetch('/api/catalog',{cache:'no-store'});if(!r.ok)throw new Error('تعذر تحميل البيانات');const data=await r.json();state.settings=data.settings||{};state.products=data.products||[];state.videos=data.videos||[];state.social_posts=data.social_posts||[];applySettings();renderCategories();renderFilters();renderProducts();renderVideos();renderFacebook();renderCart();$('#demo-note').hidden=!data.demo;}catch(err){$('#product-grid').innerHTML='<div class="videos-empty">تعذر الوصول إلى المتجر. أعد تشغيل الخادم وحاول تحديث الصفحة.</div>';toast(err.message);}}
+-function initEvents(){$$('[data-fb-filter]').forEach(btn=>btn.addEventListener('click',()=>{state.fbFilter=btn.dataset.fbFilter;renderFacebook();}));$('#product-search').addEventListener('input',e=>{state.search=e.target.value;renderProducts();});$('#header-search').onclick=()=>{$('#products').scrollIntoView({behavior:'smooth'});setTimeout(()=>$('#product-search').focus(),500);};$('#sort-products').onchange=e=>{state.sort=e.target.value;renderProducts();};$('#reset-filters').onclick=()=>{state.filter='الكل';state.search='';$('#product-search').value='';renderFilters();renderProducts();};$('#open-cart').onclick=openDrawer;$('#mobile-cart').onclick=openDrawer;$('#checkout-btn').onclick=()=>{if(!state.cart.length)return;$('#checkout-form').hidden=false;$('#order-success').hidden=true;$('#checkout-form').reset();openModal('checkout-modal');};$('#checkout-form').onsubmit=submitOrder;$('#overlay').onclick=closeDrawer;$$('[data-close="drawer"]').forEach(b=>b.onclick=closeDrawer);$$('[data-close="modal"]').forEach(b=>b.onclick=closeModals);$$('.modal').forEach(m=>m.addEventListener('click',e=>{if(e.target===m)closeModals();}));document.onkeydown=e=>{if(e.key==='Escape'){closeModals();closeDrawer();}};$('#menu-toggle').onclick=()=>{$('#mobile-menu').hidden=!$('#mobile-menu').hidden;};$$('#mobile-menu a').forEach(a=>a.onclick=()=>{$('#mobile-menu').hidden=true;});const theme=localStorage.getItem('furat_theme');if(theme==='light')document.body.classList.add('light-mode');$('#theme-toggle').onclick=()=>{document.body.classList.toggle('light-mode');localStorage.setItem('furat_theme',document.body.classList.contains('light-mode')?'light':'dark');};document.addEventListener('scroll',()=>{const links=$$('.desktop-nav .nav-link');let current='top';['top','categories','products','facebook','videos','contact'].forEach(id=>{const el=$('#'+id);if(el&&el.getBoundingClientRect().top<180)current=id;});links.forEach(a=>a.classList.toggle('active',a.getAttribute('href')==='#'+current));},{passive:true});}
++function initEvents(){$$('[data-fb-filter]').forEach(btn=>btn.addEventListener('click',()=>{state.fbFilter=btn.dataset.fbFilter;renderFacebook();}));$('#product-search').addEventListener('input',e=>{state.search=e.target.value;renderProducts();});$('#header-search').onclick=()=>{$('#products').scrollIntoView({behavior:'smooth'});setTimeout(()=>$('#product-search').focus(),500);};$('#sort-products').onchange=e=>{state.sort=e.target.value;renderProducts();};$('#reset-filters').onclick=()=>{state.filter='الكل';state.search='';$('#product-search').value='';renderFilters();renderProducts();};$('#open-cart').onclick=openDrawer;$('#mobile-cart').onclick=openDrawer;$('#checkout-btn').onclick=()=>{if(!state.cart.length)return;$('#checkout-form').hidden=false;$('#order-success').hidden=true;$('#checkout-form').reset();openModal('checkout-modal');loadCheckoutAccount();};$('#cart-inquiry').onclick=inquireAboutCart;$('#checkout-form').onsubmit=submitOrder;$('#overlay').onclick=closeDrawer;$$('[data-close="drawer"]').forEach(b=>b.onclick=closeDrawer);$$('[data-close="modal"]').forEach(b=>b.onclick=closeModals);$$('.modal').forEach(m=>m.addEventListener('click',e=>{if(e.target===m)closeModals();}));document.onkeydown=e=>{if(e.key==='Escape'){closeModals();closeDrawer();}};$('#menu-toggle').onclick=()=>{$('#mobile-menu').hidden=!$('#mobile-menu').hidden;};$$('#mobile-menu a').forEach(a=>a.onclick=()=>{$('#mobile-menu').hidden=true;});const theme=localStorage.getItem('furat_theme');if(theme==='light')document.body.classList.add('light-mode');$('#theme-toggle').onclick=()=>{document.body.classList.toggle('light-mode');localStorage.setItem('furat_theme',document.body.classList.contains('light-mode')?'light':'dark');};document.addEventListener('scroll',()=>{const links=$$('.desktop-nav .nav-link');let current='top';['top','categories','products','facebook','videos','contact'].forEach(id=>{const el=$('#'+id);if(el&&el.getBoundingClientRect().top<180)current=id;});links.forEach(a=>a.classList.toggle('active',a.getAttribute('href')==='#'+current));},{passive:true});}
+ initEvents();reveal();loadCatalog();
+ if('serviceWorker' in navigator&&location.protocol==='https:')navigator.serviceWorker.register('/sw.js').catch(()=>{});
+--- a/index.html
++++ b/index.html
+@@ -13,7 +13,8 @@
+   <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
+   <link rel="stylesheet" href="/static/styles.css?v=3" />
+   <link rel="stylesheet" href="/static/catalog.css?v=3" />
+-  <script src="/static/app.js?v=3" defer></script>
++  <link rel="stylesheet" href="/static/account.css">
++  <script src="/static/app.js?v=5" defer></script>
+   <script src="/static/catalog.js?v=3" defer></script>
+ </head>
+ <body>
+@@ -27,7 +28,7 @@
+       <nav class="desktop-nav" aria-label="القائمة الرئيسية">
+         <a class="nav-link active" href="#top">الرئيسية</a><a class="nav-link" href="#categories">الأقسام</a><a class="nav-link" href="#products">المنتجات</a><a class="nav-link" href="#facebook">فيسبوك</a><a class="nav-link" href="#videos">الفيديوهات</a><a class="nav-link" href="#contact">تواصل معنا</a>
+       </nav>
+-      <div class="header-actions">
++      <div class="header-actions"><a class="account-link" href="/account">حسابي</a>
+         <button id="header-search" class="icon-btn header-search" aria-label="بحث"><svg><use href="/static/assets/icons.svg#search"/></svg></button>
+         <button id="theme-toggle" class="icon-btn" aria-label="تبديل المظهر"><svg><use href="/static/assets/icons.svg#moon"/></svg></button>
+         <button id="open-cart" class="icon-btn cart-btn" aria-label="سلة المشتريات"><svg><use href="/static/assets/icons.svg#bag"/></svg><span class="cart-count" id="cart-count">0</span></button>
+@@ -92,12 +93,12 @@
+     <section id="contact" class="section contact-section"><div class="container"><div class="contact-wrap reveal"><div class="contact-glow"></div><div class="contact-copy"><span class="kicker">دائماً بالقرب منك</span><h2>جاهز تختار <span>جوالك القادم؟</span></h2><p>تواصل معنا لمعرفة الأسعار والتوفر وخيارات التوصيل، أو تفضل بزيارة المتجر.</p><div class="contact-pills"><span><svg class="i"><use href="/static/assets/icons.svg#location"/></svg><span id="store-address">صنعاء - شميلة - مول غزة</span></span><span id="store-phone-wrap" hidden><svg class="i"><use href="/static/assets/icons.svg#phone"/></svg><span id="store-phone"></span></span></div><div class="contact-actions"><a id="whatsapp-cta" class="btn btn-primary" href="#contact"><svg class="i"><use href="/static/assets/icons.svg#whatsapp"/></svg> تواصل واتساب</a><a class="btn btn-outline" href="#products">تصفح المتجر</a></div></div><div class="contact-logo"><div class="contact-logo-ring"></div><div class="contact-logo-center"><img src="/static/assets/brand-mark.svg" class="contact-brand-mark" alt="الفرات موبايل"/><strong>الفرات موبايل</strong><small>AL FURAT MOBILE</small></div></div></div></div></section>
+   </main>
+   <footer class="site-footer"><div class="container"><div class="footer-main"><div class="footer-about"><a class="footer-logo" href="#top">✦ <b>الفرات موبايل</b></a><p>وجهتك للتقنية والهواتف الذكية والإكسسوارات. تصفح المنتجات واستعرض الفيديوهات واطلب ما يناسبك.</p><div id="social-links" class="social-links"></div></div><div class="footer-menu"><h4>روابط سريعة</h4><a href="#top">الرئيسية</a><a href="#categories">الأقسام</a><a href="#products">جميع المنتجات</a><a href="#videos">الفيديوهات</a></div><div class="footer-menu"><h4>المتجر</h4><a href="#contact">تواصل معنا</a><a href="/admin">إدارة المتجر</a><a id="app-link-footer" href="#contact" hidden>تطبيق إضافة المنتجات</a><span id="footer-payment">الدفع بعد تأكيد الطلب</span></div><div class="footer-news"><h4>نبقى على تواصل</h4><p>تابع صفحاتنا لتصلك أخبار المنتجات والعروض عندما تُنشر.</p><a href="#contact" class="btn btn-soft">وسائل التواصل <svg class="i"><use href="/static/assets/icons.svg#arrow-left"/></svg></a></div></div><div class="footer-bottom"><span>© <span id="current-year"></span> الفرات موبايل. جميع الحقوق محفوظة.</span><span>صُمم بحب للتقنية <span class="footer-heart">♥</span></span></div></div></footer>
+-  <nav class="mobile-bottom-nav" aria-label="التنقل السريع"><a href="#top" class="selected"><svg class="i"><use href="/static/assets/icons.svg#grid"/></svg><span>الرئيسية</span></a><a href="#products"><svg class="i"><use href="/static/assets/icons.svg#search"/></svg><span>المنتجات</span></a><button id="mobile-cart"><svg class="i"><use href="/static/assets/icons.svg#bag"/></svg><span>السلة</span></button><a href="#contact"><svg class="i"><use href="/static/assets/icons.svg#phone"/></svg><span>تواصل</span></a></nav>
++  <nav class="mobile-bottom-nav" aria-label="التنقل السريع"><a href="#top" class="selected"><svg class="i"><use href="/static/assets/icons.svg#grid"/></svg><span>الرئيسية</span></a><a href="#products"><svg class="i"><use href="/static/assets/icons.svg#search"/></svg><span>المنتجات</span></a><button id="mobile-cart"><svg class="i"><use href="/static/assets/icons.svg#bag"/></svg><span>السلة</span></button><a href="/account"><svg class="i" aria-hidden="true"><use href="/static/assets/icons.svg#settings"/></svg><span>حسابي</span></a><a href="#contact"><svg class="i"><use href="/static/assets/icons.svg#phone"/></svg><span>تواصل</span></a></nav>
+   <div id="overlay" class="screen-overlay" hidden></div>
+-  <aside id="cart-drawer" class="cart-drawer" role="dialog" aria-modal="true" aria-label="سلة المشتريات" aria-hidden="true"><header class="drawer-header"><div><span class="eyebrow-sm">مشترياتك</span><h3>سلة التسوق <span id="cart-heading-count">(0)</span></h3></div><button class="icon-btn" data-close="drawer" aria-label="إغلاق السلة"><svg><use href="/static/assets/icons.svg#close"/></svg></button></header><div id="cart-items" class="cart-items"></div><div class="cart-footer"><div class="cart-subtotal"><span>الإجمالي</span><b id="cart-total">السعر عند الطلب</b></div><small>الأسعار النهائية وخيارات الدفع والتوصيل تؤكد مع المتجر.</small><button id="checkout-btn" class="btn btn-primary btn-wide">إتمام الطلب <svg class="i"><use href="/static/assets/icons.svg#arrow-left"/></svg></button></div></aside>
++  <aside id="cart-drawer" class="cart-drawer" role="dialog" aria-modal="true" aria-label="سلة المشتريات" aria-hidden="true"><header class="drawer-header"><div><span class="eyebrow-sm">مشترياتك</span><h3>سلة التسوق <span id="cart-heading-count">(0)</span></h3></div><button class="icon-btn" data-close="drawer" aria-label="إغلاق السلة"><svg><use href="/static/assets/icons.svg#close"/></svg></button></header><div id="cart-items" class="cart-items"></div><div class="cart-footer"><div class="cart-subtotal"><span>الإجمالي</span><b id="cart-total">السعر عند الطلب</b></div><small>الأسعار النهائية وخيارات الدفع والتوصيل تؤكد مع المتجر.</small><button id="checkout-btn" class="btn btn-primary btn-wide">إتمام الطلب <svg class="i"><use href="/static/assets/icons.svg#arrow-left"/></svg></button><button id="cart-inquiry" type="button" class="btn btn-soft btn-wide" hidden>استفسر عبر واتساب <svg class="i"><use href="/static/assets/icons.svg#whatsapp"/></svg></button></div></aside>
+   <div id="quickview-modal" class="modal" role="dialog" aria-modal="true" aria-label="تفاصيل المنتج" hidden><div class="modal-card quickview-card"><button class="modal-close icon-btn" data-close="modal" aria-label="إغلاق"><svg><use href="/static/assets/icons.svg#close"/></svg></button><div id="quickview-body"></div></div></div>
+   <div id="video-modal" class="modal" role="dialog" aria-modal="true" aria-label="عرض الفيديو" hidden><div class="modal-card video-modal-card"><button class="modal-close icon-btn" data-close="modal" aria-label="إغلاق"><svg><use href="/static/assets/icons.svg#close"/></svg></button><div id="video-modal-body"></div></div></div>
+-  <div id="checkout-modal" class="modal" role="dialog" aria-modal="true" aria-label="إتمام الطلب" hidden><div class="modal-card checkout-card"><button class="modal-close icon-btn" data-close="modal" aria-label="إغلاق"><svg><use href="/static/assets/icons.svg#close"/></svg></button><div class="modal-head"><span class="kicker">خطوة واحدة متبقية</span><h3>تأكيد طلبك</h3><p>أدخل معلومات التواصل ليصل طلبك إلى إدارة المتجر.</p></div><form id="checkout-form"><div class="two-fields"><label>الاسم الكامل *<input name="customer_name" required minlength="2" maxlength="100" autocomplete="name" /></label><label>رقم الجوال *<input name="phone" type="tel" required minlength="6" maxlength="35" autocomplete="tel" /></label></div><div class="two-fields"><label>المدينة *<input name="city" required minlength="2" maxlength="100" /></label><label>طريقة الدفع *<select name="payment_method"><option>عند الاستلام</option><option>تحويل بنكي / محفظة</option><option>الاتفاق مع المتجر</option></select></label></div><label>عنوان التوصيل *<input name="address" required minlength="3" maxlength="300" placeholder="الحي، الشارع، أقرب معلم" /></label><label>ملاحظات إضافية<textarea name="note" maxlength="1000" rows="3" placeholder="لون الجهاز، وقت التواصل المناسب... (اختياري)"></textarea></label><div class="order-summary-line"><span>الإجمالي المبدئي</span><strong id="checkout-total">—</strong></div><button class="btn btn-primary btn-wide" type="submit" id="submit-order">إرسال الطلب <svg class="i"><use href="/static/assets/icons.svg#check"/></svg></button><small class="form-note">لا يتم تحصيل أي دفعة إلكترونية عبر هذا الموقع.</small></form><div id="order-success" class="order-success" hidden></div></div></div>
++  <div id="checkout-modal" class="modal" role="dialog" aria-modal="true" aria-label="إتمام الطلب" hidden><div class="modal-card checkout-card"><button class="modal-close icon-btn" data-close="modal" aria-label="إغلاق"><svg><use href="/static/assets/icons.svg#close"/></svg></button><div class="modal-head"><span class="kicker">خطوة واحدة متبقية</span><h3>تأكيد طلبك</h3><p>أدخل معلومات التواصل ليصل طلبك إلى إدارة المتجر.</p></div><p id="checkout-account-note"><a href="/account">سجّل الدخول لمتابعة الطلب من حسابك</a>، أو أكمل الشراء كضيف.</p><form id="checkout-form"><div class="two-fields"><label>الاسم الكامل *<input name="customer_name" required minlength="2" maxlength="100" autocomplete="name" /></label><label>رقم الجوال *<input name="phone" type="tel" required minlength="6" maxlength="35" autocomplete="tel" /></label></div><div class="two-fields"><label>المدينة *<input name="city" required minlength="2" maxlength="100" /></label><label>طريقة الدفع *<select name="payment_method"><option>عند الاستلام</option><option>تحويل بنكي / محفظة</option><option>الاتفاق مع المتجر</option></select></label></div><label>عنوان التوصيل *<input name="address" required minlength="3" maxlength="300" placeholder="الحي، الشارع، أقرب معلم" /></label><label>ملاحظات إضافية<textarea name="note" maxlength="1000" rows="3" placeholder="لون الجهاز، وقت التواصل المناسب... (اختياري)"></textarea></label><div class="order-summary-line"><span>الإجمالي المبدئي</span><strong id="checkout-total">—</strong></div><button class="btn btn-primary btn-wide" type="submit" id="submit-order">إرسال الطلب <svg class="i"><use href="/static/assets/icons.svg#check"/></svg></button><small class="form-note">لا يتم تحصيل أي دفعة إلكترونية عبر هذا الموقع.</small></form><div id="order-success" class="order-success" hidden></div></div></div>
+   <div id="toast" class="toast" role="status" aria-live="polite"></div>
+ </body>
+ </html>
+--- a/sw.js
++++ b/sw.js
+@@ -1,5 +1,5 @@
+-const CACHE='alfurat-shell-v3-catalog';
+-const ASSETS=['/','/static/styles.css','/static/app.js','/static/catalog.css','/static/catalog.js','/static/assets/favicon.svg','/static/assets/icons.svg'];
++const CACHE='alfurat-shell-v5-catalog';
++const ASSETS=['/','/static/styles.css','/static/app.js?v=5','/static/account.css','/static/catalog.css','/static/catalog.js','/static/assets/favicon.svg','/static/assets/icons.svg'];
+ self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS)).then(()=>self.skipWaiting())));
+ self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim())));
+ self.addEventListener('fetch',e=>{const req=e.request;if(req.method!=='GET'||req.url.includes('/api/')||req.url.includes('/uploads/'))return;e.respondWith(fetch(req).then(r=>{if(r.ok&&new URL(req.url).origin===self.location.origin){const copy=r.clone();caches.open(CACHE).then(c=>c.put(req,copy));}return r;}).catch(()=>caches.match(req)));});
+--- a/admin.html
++++ b/admin.html
+@@ -1,15 +1,31 @@
+-<!doctype html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><meta name="theme-color" content="#091a31"/><title>لوحة تحكم الفرات موبايل</title><link rel="icon" href="/static/assets/favicon.svg" type="image/svg+xml"/><link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"/><link rel="stylesheet" href="/static/admin.css"/><script defer src="/static/admin.js"></script></head>
++<!doctype html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><meta name="theme-color" content="#091a31"/><title>لوحة تحكم الفرات موبايل</title><link rel="icon" href="/static/assets/favicon.svg" type="image/svg+xml"/><link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"/><link rel="stylesheet" href="/static/admin.css"/><script defer src="/static/admin.js?v=2"></script></head>
+ <body>
+ <div id="login-screen" class="login-screen"><div class="login-orbit orb-1"></div><div class="login-orbit orb-2"></div><form id="login-form" class="login-card"><div class="login-brand"><img src="/static/assets/favicon.svg" alt=""/><div><h1>الفرات <span>موبايل</span></h1><small>لوحة إدارة المتجر</small></div></div><span class="login-kicker">مرحباً بعودتك</span><h2>دخول المدير</h2><p>أدخل كلمة المرور للوصول إلى إدارة منتجات المتجر والطلبات والفيديوهات.</p><label>كلمة المرور<input type="password" name="password" required autocomplete="current-password" placeholder="أدخل كلمة المرور"/></label><button type="submit" class="primary-btn full" id="login-submit">دخول لوحة التحكم</button><span id="login-error" class="error-message"></span><a class="back-to-store" href="/">→ العودة إلى المتجر</a></form></div>
+ <div id="admin-app" class="admin-layout" hidden>
+-  <aside class="sidebar" id="sidebar"><div class="sidebar-brand"><img src="/static/assets/favicon.svg" alt=""/><div><b>الفرات موبايل</b><small>مركز الإدارة</small></div></div><div class="sidebar-caption">القائمة الرئيسية</div><nav class="side-nav"><button class="side-link active" data-section="dashboard"><span class="side-icon">▦</span>نظرة عامة</button><button class="side-link" data-section="products"><span class="side-icon">▣</span>المنتجات</button><button class="side-link" data-section="facebook"><span class="side-icon">ⓕ</span>إعلانات فيسبوك</button><button class="side-link" data-section="videos"><span class="side-icon">▷</span>الفيديوهات</button><button class="side-link" data-section="orders"><span class="side-icon">▤</span>الطلبات <span id="order-badge" class="side-count" hidden></span></button><button class="side-link" data-section="settings"><span class="side-icon">⚙</span>إعدادات المتجر</button><button class="side-link" data-section="import"><span class="side-icon">↥</span>استيراد المنتجات</button><button class="side-link" data-section="security"><span class="side-icon">♧</span>الأمان</button></nav><div class="sidebar-bottom"><a href="/" target="_blank" class="store-view">↗ فتح المتجر</a><button id="logout" class="logout-btn">⟵ تسجيل الخروج</button></div></aside>
++  <aside class="sidebar" id="sidebar"><div class="sidebar-brand"><img src="/static/assets/favicon.svg" alt=""/><div><b>الفرات موبايل</b><small>مركز الإدارة</small></div></div><div class="sidebar-caption">القائمة الرئيسية</div><nav class="side-nav"><button class="side-link active" data-section="dashboard"><span class="side-icon">▦</span>نظرة عامة</button><button class="side-link" data-section="products"><span class="side-icon">▣</span>المنتجات</button><button class="side-link" data-section="facebook"><span class="side-icon">ⓕ</span>إعلانات فيسبوك</button><button class="side-link" data-section="videos"><span class="side-icon">▷</span>الفيديوهات</button><button class="side-link" data-section="orders"><span class="side-icon">▤</span>الطلبات <span id="order-badge" class="side-count" hidden></span></button><button class="side-link" data-section="customers"><span class="side-icon">◉</span>حسابات العملاء</button><button class="side-link" data-section="settings"><span class="side-icon">⚙</span>إعدادات المتجر</button><button class="side-link" data-section="import"><span class="side-icon">↥</span>استيراد المنتجات</button><button class="side-link" data-section="security"><span class="side-icon">♧</span>الأمان</button></nav><div class="sidebar-bottom"><a href="/" target="_blank" class="store-view">↗ فتح المتجر</a><button id="logout" class="logout-btn">⟵ تسجيل الخروج</button></div></aside>
+   <main class="main-area"><header class="admin-header"><div class="header-intro"><button id="sidebar-toggle" class="menu-btn" aria-label="فتح القائمة">☰</button><div><small>التحكم الكامل بمتجرك</small><h1 id="page-title">نظرة عامة</h1></div></div><div class="header-actions"><span class="live-indicator"><i></i> الموقع جاهز</span><a href="/" target="_blank" class="header-preview">زيارة المتجر ↗</a><div class="admin-avatar">ف</div></div></header>
+   <div class="admin-content">
+     <section class="admin-section active" id="section-dashboard"><div class="page-description">مرحباً بك في مركز تحكم الفرات موبايل. يمكنك إدارة كل محتوى المتجر من هنا.</div><div id="stat-cards" class="stat-grid"></div><div class="dash-grid"><div class="panel"><div class="panel-head"><h3>أحدث الطلبات</h3><button data-goto="orders" class="text-button">عرض الكل ←</button></div><div id="recent-orders" class="recent-orders"></div></div><div class="panel"><div class="panel-head"><h3>المنتجات حسب القسم</h3></div><div id="category-statistics" class="category-statistics"></div></div></div><div class="help-callout"><span class="callout-icon">✦</span><div><strong>خطوات إعداد متجرك</strong><p>أضف منتجاتك الحقيقية وصورها وأسعارها، ثم روابط الفيديوهات وحسابات التواصل ورقم واتساب. يمكنك استيراد بيانات المنتجات من ملف JSON أو CSV.</p></div><button data-goto="settings" class="text-button">الإعدادات ←</button></div></section>
+     <section class="admin-section" id="section-products"><div class="section-action-header"><div><h2>إدارة المنتجات</h2><p>أضف هواتف وإكسسوارات جديدة أو حدّث الصور والأسعار والمخزون.</p></div><button class="primary-btn" id="add-product">+ إضافة منتج</button></div><div class="panel"><div class="table-tools"><input id="admin-product-search" type="search" placeholder="ابحث باسم المنتج أو القسم..."/><span id="products-count-admin" class="table-count"></span></div><div class="table-scroller"><table><thead><tr><th>المنتج</th><th>القسم</th><th>السعر</th><th>المخزون</th><th>مميز</th><th>الإجراءات</th></tr></thead><tbody id="products-table"></tbody></table></div></div></section>
+     <section class="admin-section" id="section-facebook"><div class="section-action-header"><div><h2>إعلانات ومنشورات فيسبوك</h2><p>أدر التصاميم الإعلانية وروابط منشورات وفيديوهات صفحتك. المنشورات لا تُجلب تلقائياً دون صلاحية API.</p></div><button class="primary-btn" id="add-social-post">+ إضافة إعلان / منشور</button></div><div class="panel"><div id="social-posts-admin-list" class="video-admin-list"></div></div><div class="help-callout"><span class="callout-icon">ⓕ</span><div><strong>طريقة إضافة فيديو فيسبوك</strong><p>انسخ رابط الفيديو العام من فيسبوك، وافتح تبويب «الفيديوهات» وأضفه، أو أضف صورة وعنوان ورابط المنشور هنا. لبعض الفيديوهات العامة قد يظهر مشغل مدمج؛ ويبقى رابط المشاهدة متاحاً دائماً.</p></div></div></section>
+     <section class="admin-section" id="section-videos"><div class="section-action-header"><div><h2>مكتبة الفيديوهات</h2><p>اربط فيديوهات يوتيوب وفيسبوك وإنستغرام وتيك توك وأي رابط فيديو آخر.</p></div><button class="primary-btn" id="add-video">+ إضافة فيديو</button></div><div class="panel"><div id="videos-admin-list" class="video-admin-list"></div></div></section>
+-    <section class="admin-section" id="section-orders"><div class="section-action-header"><div><h2>طلبات العملاء</h2><p>تابع طلبات الشراء وحالات تجهيزها. الطلبات تصل إلى هذه اللوحة مباشرة.</p></div><button class="secondary-btn" id="refresh-data">↻ تحديث</button></div><div class="panel"><div class="table-scroller"><table><thead><tr><th>رقم الطلب</th><th>العميل</th><th>المنتجات</th><th>الإجمالي</th><th>التاريخ</th><th>الحالة</th><th>تفاصيل</th></tr></thead><tbody id="orders-table"></tbody></table></div></div></section>
++    <section class="admin-section" id="section-orders"><div class="section-action-header"><div><h2>طلبات العملاء</h2><p>تابع طلبات الشراء وحالات تجهيزها. الطلبات تصل إلى هذه اللوحة مباشرة.</p></div><button class="secondary-btn" id="refresh-data">↻ تحديث</button></div><div class="panel">
++      <div class="admin-filters">
++        <label>بحث في أحدث 500 طلب <input type="search" id="order-search" placeholder="رقم الطلب، الاسم، الهاتف أو المدينة"></label>
++        <label>الحالة <select id="order-filter"><option value="">كل الحالات</option></select></label>
++        <span id="filtered-orders-count" role="status"></span>
++      </div><div class="table-scroller"><table><thead><tr><th>رقم الطلب</th><th>العميل</th><th>المنتجات</th><th>الإجمالي</th><th>التاريخ</th><th>الحالة</th><th>تفاصيل</th></tr></thead><tbody id="orders-table"></tbody></table></div></div></section>
++    <section class="admin-section" id="section-customers">
++      <div class="section-action-header"><h2>حسابات العملاء</h2></div>
++      <div class="panel">
++        <form id="customer-search" class="admin-filters" role="search">
++          <label>الاسم أو البريد الإلكتروني <input name="q" type="search" maxlength="254"></label>
++          <button class="secondary-btn" type="submit">بحث</button>
++        </form>
++        <div class="table-scroll"><table><thead><tr><th>الاسم</th><th>البريد الإلكتروني</th><th>تاريخ التسجيل</th><th>الطلبات</th></tr></thead><tbody id="customers-table"></tbody></table></div>
++        <div class="admin-filters"><button class="secondary-btn" id="customer-prev" type="button" disabled>السابق</button><span id="customer-page" role="status"></span><button class="secondary-btn" id="customer-next" type="button" disabled>التالي</button></div>
++      </div>
++    </section>
+     <section class="admin-section" id="section-settings"><div class="section-action-header"><div><h2>إعدادات الهوية والتواصل</h2><p>غيّر اسم متجرك وشعاره والعنوان والرسائل وروابط المنصات الاجتماعية.</p></div><button class="primary-btn" type="submit" form="settings-form">حفظ التغييرات</button></div><form id="settings-form"><div class="panel form-panel"><div class="form-heading"><span>◈</span><div><h3>هوية المتجر</h3><p>هذه البيانات تظهر في الصفحة الرئيسية والترويسة.</p></div></div><div class="form-grid"><label>اسم المتجر<input name="store_name" maxlength="100"/></label><label>وصف قصير للشعار<input name="store_subtitle" maxlength="120"/></label><label class="span2">عنوان الواجهة الرئيسية<input name="hero_title" maxlength="150"/></label><label class="span2">وصف الواجهة الرئيسية<textarea name="hero_description" rows="2"></textarea></label><label class="span2">شريط الإعلان العلوي<input name="announcement" maxlength="250"/></label><label class="span2">رابط شعار المتجر (يمكنك رفعه)<input name="logo_url" type="text" placeholder="https://... أو /uploads/..."/></label><label>رفع صورة الشعار<input type="file" id="logo-file" accept="image/png,image/jpeg,image/webp"/></label><div class="upload-preview" id="logo-preview"></div></div></div>
+       <div class="panel form-panel"><div class="form-heading"><span>⌖</span><div><h3>العنوان وطرق التواصل</h3><p>أضف الأرقام بشكل كامل مع رمز الدولة؛ مثال اليمن 967.</p></div></div><div class="form-grid"><label>رقم واتساب (بدون +)<input name="whatsapp" placeholder="9677XXXXXXXX" dir="ltr"/></label><label>رقم الهاتف<input name="phone" placeholder="رقم الاتصال" dir="ltr"/></label><label class="span2">عنوان المحل<input name="address" placeholder="المدينة - المنطقة - المركز التجاري"/></label><label>العملة<input name="currency" placeholder="ر.ي"/></label><label>رسالة التوصيل<input name="delivery_text"/></label><label class="span2">رسالة طرق الدفع<input name="payment_text"/></label></div></div>
+       <div class="panel form-panel"><div class="form-heading"><span>◉</span><div><h3>روابط مواقع التواصل</h3><p>أضف رابط كل حساب وسيظهر رمز المنصة تلقائياً في المتجر.</p></div></div><div class="form-grid"><label>إنستغرام<input name="instagram" type="text" dir="ltr" placeholder="https://instagram.com/..."/></label><label>فيسبوك — رابط الصفحة<input name="facebook" type="text" dir="ltr" placeholder="https://facebook.com/..."/></label><label>عنوان الصفحة المباشر للتضمين (اختياري)<input name="facebook_page_url" type="text" dir="ltr" placeholder="https://www.facebook.com/YourPageName"/><small>رابط المشاركة /share/ لا يكفي للتضمين. ضع رابط الصفحة المباشر إذا توفر؛ المشاهدة داخل الموقع تخضع لإعدادات فيسبوك.</small></label><label>تيك توك<input name="tiktok" type="text" dir="ltr" placeholder="https://tiktok.com/@..."/></label><label>قناة يوتيوب<input name="youtube" type="text" dir="ltr" placeholder="https://youtube.com/@..."/></label><label>تيليجرام<input name="telegram" type="text" dir="ltr" placeholder="https://t.me/..."/></label><label>سناب شات<input name="snapchat" type="text" dir="ltr" placeholder="https://snapchat.com/..."/></label><label>منصة X<input name="x" type="text" dir="ltr" placeholder="https://x.com/..."/></label><label>رابط تطبيق إضافة المنتجات<input name="app_url" type="text" dir="ltr" placeholder="https://..."/><small>هذا الحقل يضيف رابط التطبيق. المزامنة الآلية تحتاج رابط واجهة API أو طريقة تصدير بيانات من التطبيق.</small></label></div><button type="submit" class="primary-btn save-settings">حفظ جميع الإعدادات</button></div></form></section>
+--- a/admin.css
++++ b/admin.css
+@@ -11,3 +11,19 @@
+ .admin-logo{color:#b7f52b}
+ 
+ .entity-form textarea[name="specs_lines"]{min-height:125px;font-family:inherit;line-height:1.8}
++
++.admin-filters {
++  display: flex;
++  gap: .75rem;
++  flex-wrap: wrap;
++  align-items: end;
++  padding: 1rem;
++}
++.admin-filters label { display: grid; gap: .25rem; }
++.admin-filters input, .admin-filters select {
++  font: inherit;
++  padding: .5rem;
++  border: 1px solid #a8b6c7;
++  border-radius: .5rem;
++  max-width: 100%;
++}
+--- a/admin.js
++++ b/admin.js
+@@ -12,8 +12,8 @@
+ function showApp(){$('#login-screen').hidden=true;$('#admin-app').hidden=false;}
+ async function authenticate(){try{const res=await api('/api/admin/me');ad.csrf=res.csrf;await refresh();showApp();}catch{showLogin();}}
+ async function refresh(){const data=await api('/api/admin/data');Object.assign(ad,data);renderDashboard();renderProducts();renderVideos();renderSocialPosts();renderOrders();fillSettings();}
+-function go(section){ad.section=section;const titles={dashboard:'نظرة عامة',products:'إدارة المنتجات',videos:'مكتبة الفيديوهات',facebook:'إعلانات فيسبوك',orders:'طلبات العملاء',settings:'إعدادات المتجر',import:'استيراد المنتجات',security:'الأمان'};$$('.admin-section').forEach(x=>x.classList.toggle('active',x.id==='section-'+section));$$('[data-section]').forEach(b=>b.classList.toggle('active',b.dataset.section===section));$('#page-title').textContent=titles[section];$('#sidebar').classList.remove('open');window.scrollTo({top:0,behavior:'smooth'});}
+-function renderDashboard(){const newOrders=ad.orders.filter(x=>x.status==='جديد').length;const stat=[['المنتجات',ad.products.length,'▣','#dff6fe','#089bbd'],['الفيديوهات',ad.videos.length,'▷','#f0e9ff','#9362df'],['طلبات المتجر',ad.orders.length,'▤','#edf8ec','#51b677'],['طلبات جديدة',newOrders,'◉','#fff1e4','#e49a4b']];$('#stat-cards').innerHTML=stat.map(x=>`<div class="stat-card" style="--stat-bg:${x[3]};--stat-color:${x[4]}"><span class="stat-icon">${x[2]}</span><small>${x[0]}</small><strong>${x[1]}</strong></div>`).join('');$('#order-badge').hidden=!newOrders;$('#order-badge').textContent=newOrders;$('#recent-orders').innerHTML=ad.orders.length?ad.orders.slice(0,5).map(x=>`<div class="recent-order"><span class="recent-order-icon">▤</span><span class="recent-order-text"><b>${esc(x.customer_name)} — ${esc(x.id)}</b><small>${esc(x.city)} · ${esc(new Date(x.created_at).toLocaleDateString('ar-YE'))}</small></span><span class="mini-status">${esc(x.status)}</span></div>`).join(''):'<div class="empty-admin">لا توجد طلبات حتى الآن</div>';const counts={};ad.products.forEach(p=>counts[p.category]=(counts[p.category]||0)+1);const max=Math.max(1,...Object.values(counts));$('#category-statistics').innerHTML=Object.keys(counts).length?Object.entries(counts).sort((a,b)=>b[1]-a[1]).map(([cat,num])=>`<div class="category-stat"><div class="category-stat-head"><span>${esc(cat)}</span><span>${num}</span></div><div class="stat-track"><div class="stat-fill" style="width:${Math.round(num/max*100)}%"></div></div></div>`).join(''):'<div class="empty-admin">أضف منتجات لتظهر الإحصاءات</div>';}
++function go(section){ad.section=section;if(section==='customers')loadCustomers(1);const titles={dashboard:'نظرة عامة',products:'إدارة المنتجات',videos:'مكتبة الفيديوهات',facebook:'إعلانات فيسبوك',orders:'طلبات العملاء',customers:'حسابات العملاء',settings:'إعدادات المتجر',import:'استيراد المنتجات',security:'الأمان'};$$('.admin-section').forEach(x=>x.classList.toggle('active',x.id==='section-'+section));$$('[data-section]').forEach(b=>b.classList.toggle('active',b.dataset.section===section));$('#page-title').textContent=titles[section];$('#sidebar').classList.remove('open');window.scrollTo({top:0,behavior:'smooth'});}
++function renderDashboard(){const newOrders=ad.orders.filter(x=>x.status==='جديد').length;const stat=[['المنتجات',ad.products.length,'▣','#dff6fe','#089bbd'],['حسابات العملاء',ad.customer_count,'◉','#f0e9ff','#9362df'],['طلبات المتجر',ad.orders.length,'▤','#edf8ec','#51b677'],['طلبات جديدة',newOrders,'◉','#fff1e4','#e49a4b']];$('#stat-cards').innerHTML=stat.map(x=>`<div class="stat-card" style="--stat-bg:${x[3]};--stat-color:${x[4]}"><span class="stat-icon">${x[2]}</span><small>${x[0]}</small><strong>${x[1]}</strong></div>`).join('');$('#order-badge').hidden=!newOrders;$('#order-badge').textContent=newOrders;$('#recent-orders').innerHTML=ad.orders.length?ad.orders.slice(0,5).map(x=>`<div class="recent-order"><span class="recent-order-icon">▤</span><span class="recent-order-text"><b>${esc(x.customer_name)} — ${esc(x.id)}</b><small>${esc(x.city)} · ${esc(new Date(x.created_at).toLocaleDateString('ar-YE'))}</small></span><span class="mini-status">${esc(x.status)}</span></div>`).join(''):'<div class="empty-admin">لا توجد طلبات حتى الآن</div>';const counts={};ad.products.forEach(p=>counts[p.category]=(counts[p.category]||0)+1);const max=Math.max(1,...Object.values(counts));$('#category-statistics').innerHTML=Object.keys(counts).length?Object.entries(counts).sort((a,b)=>b[1]-a[1]).map(([cat,num])=>`<div class="category-stat"><div class="category-stat-head"><span>${esc(cat)}</span><span>${num}</span></div><div class="stat-track"><div class="stat-fill" style="width:${Math.round(num/max*100)}%"></div></div></div>`).join(''):'<div class="empty-admin">أضف منتجات لتظهر الإحصاءات</div>';}
+ function renderProducts(){const term=($('#admin-product-search')?.value||'').toLocaleLowerCase('ar');const rows=ad.products.filter(x=>(x.name+' '+x.category).toLocaleLowerCase('ar').includes(term));$('#products-count-admin').textContent=rows.length+' منتج';$('#products-table').innerHTML=rows.length?rows.map(p=>`<tr><td><div class="table-product">${p.image_url?`<img class="thumb-small" src="${esc(p.image_url)}" alt="" onerror="this.style.display='none'">`:'<span class="thumb-small">▣</span>'}<div><strong>${esc(p.name)}</strong><small>${esc(p.id)}</small></div></div></td><td>${esc(p.category)}</td><td>${formatPrice(p.price)}</td><td><span class="stock-pill ${p.stock===0?'out':p.stock===-1?'unknown':''}">${p.stock===-1?'غير محدد':p.stock===0?'غير متوفر':p.stock}</span></td><td>${p.featured?'✦ نعم':'—'}</td><td><div class="table-actions"><button data-edit-p="${esc(p.id)}">تعديل</button><button class="delete" data-delete-p="${esc(p.id)}">حذف</button></div></td></tr>`).join(''):'<tr><td colspan="6" class="empty-admin">لا توجد منتجات مطابقة.</td></tr>';$$('[data-edit-p]').forEach(b=>b.onclick=()=>openProduct(b.dataset.editP));$$('[data-delete-p]').forEach(b=>b.onclick=()=>deleteProduct(b.dataset.deleteP));}
+ function renderVideos(){$('#videos-admin-list').innerHTML=ad.videos.length?ad.videos.map(v=>{let thumb=v.thumbnail_url;try{const url=new URL(v.url);const yt=url.hostname.includes('youtu.be')?url.pathname.split('/')[1]:url.searchParams.get('v')||(url.pathname.match(/\/(?:shorts|embed)\/([\w-]{11})/)||[])[1];if(!thumb&&yt&&/^[\w-]{11}$/.test(yt))thumb=`https://i.ytimg.com/vi/${yt}/hqdefault.jpg`;}catch{}return `<div class="video-admin-row"><div class="video-admin-thumb">${thumb?`<img src="${esc(thumb)}" alt="">`:'▷'}</div><div class="video-admin-body"><h4>${esc(v.title)}</h4><a href="${esc(v.url)}" target="_blank" rel="noopener noreferrer">${esc(v.url)}</a></div><div class="table-actions"><button data-edit-v="${esc(v.id)}">تعديل</button><button class="delete" data-delete-v="${esc(v.id)}">حذف</button></div></div>`;}).join(''):'<div class="empty-admin">لا توجد فيديوهات بعد. اضغط "إضافة فيديو" للبدء.</div>';$$('[data-edit-v]').forEach(b=>b.onclick=()=>openVideo(b.dataset.editV));$$('[data-delete-v]').forEach(b=>b.onclick=()=>deleteVideo(b.dataset.deleteV));}
+ function renderSocialPosts(){
+@@ -28,7 +28,15 @@
+  $('#social-post-form').onsubmit=async e=>{e.preventDefault();const form=e.currentTarget,btn=$('#social-save');btn.disabled=true;try{let image_url=fieldVal(form,'image_url');const file=form.elements.namedItem('image_file').files[0];if(file)image_url=await upload(file);const data={title:fieldVal(form,'title'),description:fieldVal(form,'description'),post_type:fieldVal(form,'post_type'),source:fieldVal(form,'source'),url:fieldVal(form,'url'),image_url};await api(p?'/api/admin/social-posts/'+encodeURIComponent(p.id):'/api/admin/social-posts',{method:p?'PUT':'POST',data});closeDialog();notice('تم حفظ الإعلان / المنشور');await refresh();}catch(err){notice(err.message);}finally{btn.disabled=false;}};
+ }
+ async function deleteSocialPost(id){if(!confirm('حذف هذا الإعلان أو المنشور من الموقع؟'))return;try{await api('/api/admin/social-posts/'+encodeURIComponent(id),{method:'DELETE'});notice('تم حذف المحتوى');await refresh();}catch(e){notice(e.message);}}
+-function renderOrders(){$('#orders-table').innerHTML=ad.orders.length?ad.orders.map(o=>`<tr><td><b>${esc(o.id)}</b></td><td>${esc(o.customer_name)}<br/><small>${esc(o.phone)}</small></td><td>${o.items.reduce((sum,i)=>sum+i.quantity,0)} عناصر</td><td>${formatPrice(o.total)}</td><td>${esc(new Date(o.created_at).toLocaleDateString('ar-YE'))}</td><td><select class="status-select" data-status="${esc(o.id)}">${opts.map(s=>`<option ${s===o.status?'selected':''}>${s}</option>`).join('')}</select></td><td><div class="table-actions"><button data-details="${esc(o.id)}">عرض</button></div></td></tr>`).join(''):'<tr><td colspan="7" class="empty-admin">لا توجد طلبات حتى الآن.</td></tr>';$$('[data-status]').forEach(s=>s.onchange=async()=>{try{await api('/api/admin/orders/'+encodeURIComponent(s.dataset.status),{method:'PATCH',data:{status:s.value}});notice('تم تحديث حالة الطلب');await refresh();}catch(e){notice(e.message);}});$$('[data-details]').forEach(b=>b.onclick=()=>openOrder(b.dataset.details));}
++function renderOrders(){
++  const term = $('#order-search').value.trim().toLowerCase();
++  const status = $('#order-filter').value;
++  const filtered = ad.orders.filter(order =>
++    (!status || status === order.status) &&
++    [order.id, order.customer_name, order.phone, order.city].some(value => value.toLowerCase().includes(term))
++  );
++  $('#filtered-orders-count').textContent = filtered.length + ' من ' + ad.orders.length;
++  $('#orders-table').innerHTML=filtered.length?filtered.map(o=>`<tr><td><b>${esc(o.id)}</b></td><td>${esc(o.customer_name)}<br/><small>${esc(o.phone)}</small></td><td>${o.items.reduce((sum,i)=>sum+i.quantity,0)} عناصر</td><td>${formatPrice(o.total)}</td><td>${esc(new Date(o.created_at).toLocaleDateString('ar-YE'))}</td><td><select class="status-select" data-status="${esc(o.id)}">${opts.map(s=>`<option ${s===o.status?'selected':''}>${s}</option>`).join('')}</select></td><td><div class="table-actions"><button data-details="${esc(o.id)}">عرض</button></div></td></tr>`).join(''):'<tr><td colspan="7" class="empty-admin">لا توجد طلبات مطابقة.</td></tr>';$$('[data-status]').forEach(s=>s.onchange=async()=>{try{await api('/api/admin/orders/'+encodeURIComponent(s.dataset.status),{method:'PATCH',data:{status:s.value}});notice('تم تحديث حالة الطلب');await refresh();}catch(e){notice(e.message);}});$$('[data-details]').forEach(b=>b.onclick=()=>openOrder(b.dataset.details));}
+ function openDialog(title,content){$('#dialog-title').textContent=title;$('#dialog-body').innerHTML=content;$('#dialog-layer').hidden=false;document.body.style.overflow='hidden';}
+ function closeDialog(){$('#dialog-layer').hidden=true;document.body.style.overflow='';$('#dialog-body').innerHTML='';}
+ async function fileToDataUrl(file){return await new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error('تعذر قراءة الملف'));r.onload=()=>resolve(r.result);r.readAsDataURL(file);});}
+@@ -39,7 +47,7 @@
+ async function deleteProduct(id){const p=ad.products.find(x=>x.id===id);if(!confirm('هل تريد حذف المنتج «'+p.name+'» نهائياً؟'))return;try{await api('/api/admin/products/'+encodeURIComponent(id),{method:'DELETE'});notice('تم حذف المنتج');await refresh();}catch(e){notice(e.message);}}
+ function openVideo(id){const v=ad.videos.find(x=>x.id===id);openDialog(v?'تعديل الفيديو':'إضافة فيديو',`<form id="video-form" class="entity-form"><label>عنوان الفيديو *<input name="title" required minlength="2" maxlength="140" value="${esc(v?.title||'')}" placeholder="استعراض سماعات لاسلكية"/></label><label>رابط الفيديو *<input name="url" required type="url" value="${esc(v?.url||'')}" placeholder="https://www.youtube.com/watch?v=..." dir="ltr"/></label><label>وصف الفيديو<textarea name="description" maxlength="1500" rows="3">${esc(v?.description||'')}</textarea></label><label>رابط صورة مصغرة (اختياري)<input name="thumbnail_url" type="text" value="${esc(v?.thumbnail_url||'')}" placeholder="https://..."></label><div class="form-actions"><button type="submit" class="primary-btn" id="video-save">${v?'حفظ التعديلات':'نشر الفيديو'}</button><button type="button" class="secondary-btn" id="cancel-video">إلغاء</button></div></form>`);$('#cancel-video').onclick=closeDialog;$('#video-form').onsubmit=async e=>{e.preventDefault();const form=e.currentTarget,btn=$('#video-save');btn.disabled=true;try{const data={title:fieldVal(form,'title'),url:fieldVal(form,'url'),description:fieldVal(form,'description'),thumbnail_url:fieldVal(form,'thumbnail_url')};await api(v?'/api/admin/videos/'+encodeURIComponent(v.id):'/api/admin/videos',{method:v?'PUT':'POST',data});closeDialog();notice(v?'تم تعديل الفيديو':'تم نشر الفيديو');await refresh();}catch(err){notice(err.message)}finally{btn.disabled=false;}};}
+ async function deleteVideo(id){if(!confirm('حذف هذا الفيديو من المتجر؟'))return;try{await api('/api/admin/videos/'+encodeURIComponent(id),{method:'DELETE'});notice('تم حذف الفيديو');await refresh();}catch(e){notice(e.message);}}
+-function openOrder(id){const o=ad.orders.find(x=>x.id===id);if(!o)return;const list=o.items.map(x=>`<div><span>${esc(x.name)} × ${x.quantity}</span><b>${formatPrice(x.subtotal)}</b></div>`).join('');openDialog('تفاصيل الطلب '+o.id,`<div class="details-box"><p><b>العميل:</b> ${esc(o.customer_name)}</p><p><b>الهاتف:</b> <a href="tel:${esc(o.phone)}">${esc(o.phone)}</a></p><p><b>المدينة والعنوان:</b> ${esc(o.city)} — ${esc(o.address)}</p><p><b>طريقة الدفع:</b> ${esc(o.payment_method)}</p><p><b>الملاحظات:</b> ${esc(o.note||'—')}</p><p><b>تاريخ الطلب:</b> ${esc(new Date(o.created_at).toLocaleString('ar-YE'))}</p><div class="details-list">${list}</div><p><b>المبلغ المبدئي:</b> ${formatPrice(o.total)}</p><p><b>الحالة:</b> ${esc(o.status)}</p><button type="button" class="secondary-btn" id="order-details-close">إغلاق</button></div>`);$('#order-details-close').onclick=closeDialog;}
++function openOrder(id){const o=ad.orders.find(x=>x.id===id);if(!o)return;const list=o.items.map(x=>`<div><span>${esc(x.name)} × ${x.quantity}</span><b>${formatPrice(x.subtotal)}</b></div>`).join('');openDialog('تفاصيل الطلب '+o.id,`<div class="details-box"><p><b>العميل:</b> ${esc(o.customer_name)}</p><p><b>نوع الطلب:</b> ${o.customer_id ? 'حساب عميل' : 'ضيف'}</p><p><b>الهاتف:</b> <a href="tel:${esc(o.phone)}">${esc(o.phone)}</a></p><p><b>المدينة والعنوان:</b> ${esc(o.city)} — ${esc(o.address)}</p><p><b>طريقة الدفع:</b> ${esc(o.payment_method)}</p><p><b>الملاحظات:</b> ${esc(o.note||'—')}</p><p><b>تاريخ الطلب:</b> ${esc(new Date(o.created_at).toLocaleString('ar-YE'))}</p><div class="details-list">${list}</div><p><b>المبلغ المبدئي:</b> ${formatPrice(o.total)}</p><p><b>الحالة:</b> ${esc(o.status)}</p><button type="button" class="secondary-btn" id="order-details-close">إغلاق</button></div>`);$('#order-details-close').onclick=closeDialog;}
+ function fillSettings(){const form=$('#settings-form');for(const [key,value] of Object.entries(ad.settings)){const el=form.elements.namedItem(key);if(el)el.value=value;}$('#logo-preview').innerHTML=ad.settings.logo_url?`<img src="${esc(ad.settings.logo_url)}" alt="الشعار الحالي" onerror="this.style.display='none'">`:'أضف صورة شعار مخصصة';}
+ function parseCsv(input){const rows=[];let field='',row=[],inQuotes=false;for(let i=0;i<input.length;i++){const c=input[i];if(c==='"'){if(inQuotes&&input[i+1]==='"'){field+='"';i++;}else inQuotes=!inQuotes;}else if(c===','&&!inQuotes){row.push(field);field='';}else if((c==='\n'||c==='\r')&&!inQuotes){if(c==='\r'&&input[i+1]==='\n')i++;row.push(field);if(row.some(v=>v.trim()))rows.push(row);row=[];field='';}else field+=c;}row.push(field);if(row.some(v=>v.trim()))rows.push(row);if(rows.length<2)return[];const keys=rows.shift().map(x=>x.replace(/^\uFEFF/,'').trim());return rows.map(cols=>Object.fromEntries(keys.map((k,i)=>[k,(cols[i]||'').trim()])));}
+ function parseSpecsImport(v){if(!v)return{};if(typeof v==='object'&&!Array.isArray(v))return Object.fromEntries(Object.entries(v).map(([k,x])=>[String(k),String(x??'')]));try{const json=JSON.parse(v);if(json&&typeof json==='object'&&!Array.isArray(json))return Object.fromEntries(Object.entries(json).map(([k,x])=>[String(k),String(x??'')]));}catch{}return parseSpecs(String(v).replaceAll('|','\n'));}
+@@ -57,4 +65,48 @@
+  $('#import-submit').onclick=handleImport;$('#download-sample').onclick=sampleCSV;$('#import-file').onchange=e=>{$('#import-preview').textContent=e.target.files[0]?'تم اختيار: '+e.target.files[0].name:'';};
+  $('#password-form').onsubmit=async e=>{e.preventDefault();const form=e.target,current=form.elements.current.value,pwd=form.elements.new.value,confirmation=form.elements.confirm.value;if(pwd!==confirmation){notice('كلمتا المرور الجديدتان غير متطابقتين');return;}try{await api('/api/admin/change-password',{method:'POST',data:{current,new:pwd}});form.reset();notice('تم تغيير كلمة المرور بنجاح');}catch(err){notice(err.message);}};
+ }
+-bind();authenticate();
++
++let customerPage = 1;
++let customerQuery = '';
++let customerRequest = 0;
++
++async function loadCustomers(page) {
++  const request = ++customerRequest;
++  const previous = $('#customer-prev');
++  const next = $('#customer-next');
++  const indicator = $('#customer-page');
++  const table = $('#customers-table');
++  previous.disabled = next.disabled = true;
++  indicator.textContent = 'جارٍ التحميل…';
++  table.replaceChildren();
++  try {
++    const params = new URLSearchParams({q: customerQuery, page});
++    const result = await api('/api/admin/customers?' + params);
++    if (request !== customerRequest) return;
++    customerPage = page;
++    previous.disabled = page <= 1;
++    next.disabled = !result.has_more;
++    indicator.textContent = 'الصفحة ' + page;
++    table.innerHTML = result.customers.map(customer =>
++      `<tr><td>${esc(customer.name)}</td><td><bdi>${esc(customer.email)}</bdi></td><td>${esc(new Date(customer.created_at).toLocaleDateString('ar-YE'))}</td><td>${customer.order_count}</td></tr>`
++    ).join('') || '<tr><td colspan="4" class="empty-admin">لا حسابات مطابقة.</td></tr>';
++  } catch (error) {
++    if (request !== customerRequest) return;
++    indicator.textContent = 'تعذر تحميل الحسابات. أعد البحث للمحاولة مرة أخرى.';
++    notice(error.message);
++  }
++}
++
++$('#customer-search').onsubmit = event => {
++  event.preventDefault();
++  customerQuery = event.currentTarget.elements.q.value.trim();
++  loadCustomers(1);
++};
++$('#customer-prev').onclick = () => loadCustomers(customerPage - 1);
++$('#customer-next').onclick = () => loadCustomers(customerPage + 1);
++$('#order-search').oninput = renderOrders;
++for (const status of opts) $('#order-filter').add(new Option(status, status));
++$('#order-filter').onchange = renderOrders;
++
++bind();
++authenticate();
+--- /dev/null
++++ b/account.html
+@@ -0,0 +1,49 @@
++<!doctype html>
++<html lang="ar" dir="rtl">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1">
++  <title>حسابي | الفرات موبايل</title>
++  <link rel="icon" href="/static/assets/favicon.svg">
++  <link rel="stylesheet" href="/static/styles.css">
++  <link rel="stylesheet" href="/static/account.css">
++  <script src="/static/account.js" defer></script>
++</head>
++<body>
++  <header class="account-header">
++    <a href="/">الفرات موبايل</a>
++    <a href="/#products">تصفح المنتجات</a>
++  </header>
++  <main class="account-main">
++    <h1>حسابي</h1>
++    <p id="account-status" role="status">جارٍ تحميل الحساب…</p>
++    <div id="account-auth" class="account-card" hidden>
++      <nav class="account-actions" aria-label="خيارات الحساب">
++        <button type="button" class="btn btn-soft" data-mode="login" aria-pressed="true">تسجيل الدخول</button>
++        <button type="button" class="btn btn-soft" data-mode="register" aria-pressed="false">إنشاء حساب</button>
++      </nav>
++      <form id="account-form">
++        <label id="account-name" hidden>الاسم الكامل
++          <input name="name" autocomplete="name" minlength="2" maxlength="100" disabled>
++        </label>
++        <label>البريد الإلكتروني
++          <input name="email" type="email" dir="ltr" autocomplete="username" maxlength="254" required>
++        </label>
++        <label>كلمة المرور
++          <input name="password" type="password" dir="ltr" autocomplete="current-password" maxlength="128" aria-describedby="password-hint" required>
++        </label>
++        <p id="password-hint" hidden>استخدم 12 حرفًا على الأقل.</p>
++        <button type="submit" class="btn btn-primary" id="account-submit">تسجيل الدخول</button>
++      </form>
++    </div>
++    <section id="account-profile" hidden>
++      <div class="account-card account-profile">
++        <div><h2 id="customer-name"></h2><bdi id="customer-email"></bdi></div>
++        <button type="button" class="btn btn-soft" id="account-logout">تسجيل الخروج</button>
++      </div>
++      <h2>أحدث طلباتي</h2>
++      <div id="customer-orders"></div>
++    </section>
++  </main>
++</body>
++</html>
+--- /dev/null
++++ b/account.css
+@@ -0,0 +1,45 @@
++.account-header {
++  background: var(--navy);
++  color: white;
++  display: flex;
++  flex-wrap: wrap;
++  gap: 1rem;
++  justify-content: space-between;
++  padding: 1rem max(1rem, calc((100% - 52rem) / 2));
++}
++.account-header a:first-child { font-weight: 800; }
++.account-main { width: min(calc(100% - 2rem), 52rem); margin: 2rem auto; }
++.account-card {
++  background: var(--paper);
++  border: 1px solid var(--border);
++  border-radius: 1rem;
++  padding: clamp(1rem, 4vw, 2rem);
++  margin-block: 1rem;
++}
++.account-actions, .account-profile {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  justify-content: space-between;
++  gap: .75rem;
++}
++.account-actions { justify-content: start; margin-bottom: 1rem; }
++.account-actions [aria-pressed="true"] { background: var(--navy); color: white; }
++#account-form { display: grid; gap: .85rem; }
++#account-form label { display: grid; gap: .35rem; font-weight: 700; }
++#account-form input {
++  width: 100%;
++  padding: .65rem;
++  border: 1px solid #71819a;
++  border-radius: .55rem;
++}
++#account-form button { justify-self: start; }
++#account-status:empty { display: none; }
++#account-status[data-error="true"] { color: #9e2736; }
++.order-title { margin: 0; font-size: 1.1rem; }
++.order-items { padding-inline-start: 1.3rem; }
++#customer-email { overflow-wrap: anywhere; }
++.account-link { color: white; font-weight: 700; white-space: nowrap; }
++@media (max-width: 600px) {
++  .header-actions .account-link { display: none; }
++}
+--- /dev/null
++++ b/account.js
+@@ -0,0 +1,127 @@
++'use strict';
++
++const form = document.querySelector('#account-form');
++const status = document.querySelector('#account-status');
++const submit = document.querySelector('#account-submit');
++const auth = document.querySelector('#account-auth');
++const profile = document.querySelector('#account-profile');
++const orders = document.querySelector('#customer-orders');
++const modes = [...document.querySelectorAll('[data-mode]')];
++let mode = 'login';
++
++function message(text = '', error = false) {
++  status.textContent = text;
++  status.dataset.error = String(error);
++}
++
++async function accountRequest(path, data) {
++  const response = await fetch('/api/account' + path, {
++    cache: 'no-store',
++    ...(data && {
++      method: 'POST',
++      headers: {'Content-Type': 'application/json', 'X-Store-Action': 'customer'},
++      body: JSON.stringify(data)
++    })
++  });
++  const result = await response.json();
++  if (!response.ok) {
++    const detail = typeof result.detail === 'string' ? result.detail : 'تحقق من البيانات وحاول مجددًا.';
++    throw new Error(detail);
++  }
++  return result;
++}
++
++function setMode(next) {
++  mode = next;
++  const registering = mode === 'register';
++  const name = form.elements.name;
++  name.disabled = !registering;
++  name.required = registering;
++  document.querySelector('#account-name').hidden = !registering;
++  document.querySelector('#password-hint').hidden = !registering;
++  form.elements.password.minLength = registering ? 12 : 1;
++  form.elements.password.autocomplete = registering ? 'new-password' : 'current-password';
++  submit.textContent = registering ? 'إنشاء حساب' : 'تسجيل الدخول';
++  modes.forEach(button => button.setAttribute('aria-pressed', String(button.dataset.mode === mode)));
++  message();
++}
++
++function node(tag, text, className) {
++  const element = document.createElement(tag);
++  if (text) element.textContent = text;
++  if (className) element.className = className;
++  return element;
++}
++
++function renderOrders(items, currency) {
++  orders.replaceChildren();
++  if (!items.length) {
++    const link = node('a', 'تصفح المنتجات', 'btn btn-primary');
++    link.href = '/#products';
++    orders.append(node('p', 'ستظهر هنا الطلبات التي ترسلها بعد تسجيل الدخول.'), link);
++    return;
++  }
++  for (const order of items) {
++    const card = node('article', '', 'account-card');
++    const title = node('h3', '', 'order-title');
++    const id = node('bdi', order.id);
++    title.append('طلب ', id);
++    const date = new Date(order.created_at).toLocaleDateString('ar-YE');
++    const list = node('ul', '', 'order-items');
++    for (const item of order.items) list.append(node('li', `${item.name} × ${item.quantity}`));
++    const total = order.items.some(item => !Number(item.price))
++      ? 'يُحدّد بعد تأكيد المتجر'
++      : new Intl.NumberFormat('ar-YE').format(order.total) + ' ' + currency;
++    card.append(title, node('p', `${order.status} · ${date}`), list, node('p', 'الإجمالي المبدئي ' + total));
++    orders.append(card);
++  }
++}
++
++async function refreshAccount() {
++  const result = await accountRequest('');
++  if (result.customer) {
++    document.querySelector('#customer-name').textContent = result.customer.name;
++    document.querySelector('#customer-email').textContent = result.customer.email;
++    renderOrders(result.orders, result.currency);
++  } else {
++    orders.replaceChildren();
++  }
++  auth.hidden = Boolean(result.customer);
++  profile.hidden = !result.customer;
++  message();
++}
++
++modes.forEach(button => button.onclick = () => setMode(button.dataset.mode));
++form.onsubmit = async event => {
++  event.preventDefault();
++  submit.disabled = true;
++  modes.forEach(button => button.disabled = true);
++  message('جارٍ التحقق…');
++  try {
++    await accountRequest('/' + mode, Object.fromEntries(new FormData(form)));
++    form.reset();
++    await refreshAccount();
++    document.querySelector('h1').scrollIntoView();
++  } catch (error) {
++    message(error.message, true);
++  } finally {
++    submit.disabled = false;
++    modes.forEach(button => button.disabled = false);
++  }
++};
++
++document.querySelector('#account-logout').onclick = async event => {
++  const button = event.currentTarget;
++  button.disabled = true;
++  try {
++    await accountRequest('/logout', {});
++    await refreshAccount();
++    setMode('login');
++  } catch (error) {
++    message(error.message, true);
++  } finally {
++    button.disabled = false;
++  }
++};
++
++refreshAccount().catch(() => message('تعذر تحميل الحساب. أعد تحميل الصفحة للمحاولة مرة أخرى.', true));
