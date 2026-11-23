@@ -24,6 +24,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from PIL import Image, UnidentifiedImageError
 
+STATIC = ROOT / 'static' if (ROOT / 'static').is_dir() else ROOT
+  
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / 'static'
 # When deployed with a Railway Volume, store mutable files on persistent storage.
